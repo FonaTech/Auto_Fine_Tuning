@@ -491,6 +491,34 @@ class TrainingOrchestrator:
         monitor = self.monitor
         stop_event = self._stop_event
 
+        # ── Resume: load adapter weights ────────────────────────────
+        if config.resume_from_checkpoint:
+            ckpt = config.resume_from_checkpoint
+            adapter_file = None
+            if os.path.isfile(ckpt) and ckpt.endswith(".safetensors"):
+                adapter_file = ckpt
+            elif os.path.isdir(ckpt):
+                # Find the highest-numbered adapter file in the dir
+                import glob
+                candidates = sorted(glob.glob(os.path.join(ckpt, "*_adapters.safetensors")))
+                if not candidates:
+                    candidates = sorted(glob.glob(os.path.join(ckpt, "adapters.safetensors")))
+                if candidates:
+                    adapter_file = candidates[-1]
+            if adapter_file:
+                try:
+                    import mlx.core as mx
+                    model.load_weights(adapter_file, strict=False)
+                    mx.eval(model.parameters())
+                    monitor.put({"type": "log",
+                                 "line": f"Resumed adapter weights from: {adapter_file}"})
+                except Exception as e:
+                    monitor.put({"type": "log",
+                                 "line": f"[WARN] Could not load adapter weights: {e}"})
+            else:
+                monitor.put({"type": "log",
+                             "line": f"[WARN] No .safetensors found at resume path: {ckpt}"})
+
         if config.training_type == "sft":
             # SFT：patch mlx_tune.sft_trainer.mlx_train 注入 TrainingCallback
             try:

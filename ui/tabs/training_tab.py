@@ -99,6 +99,8 @@ def build_training_tab(
             register_translatable(resume_compat_status, label_key="training.resume.compat")
             resume_enabled = gr.Checkbox(value=False, label=tr("training.resume.enable"))
             register_translatable(resume_enabled, label_key="training.resume.enable")
+            # State mirrors: accordion inputs aren't sent when accordion is closed
+            resume_enabled_state = gr.State(False)
             with gr.Row():
                 apply_config_btn = gr.Button(tr("training.resume.apply_config"), variant="secondary")
                 register_translatable(apply_config_btn, label_key="training.resume.apply_config")
@@ -163,6 +165,13 @@ def build_training_tab(
                     config_components["lora_r"], config_components["lora_alpha"],
                     config_components["target_modules"]],
             outputs=[resume_compat_status, resume_enabled, resume_ckpt_path_state],
+        )
+
+        # Keep resume_enabled_state in sync (State is always readable even inside closed accordion)
+        resume_enabled.change(
+            fn=lambda v: v,
+            inputs=[resume_enabled],
+            outputs=[resume_enabled_state],
         )
 
         # ── Apply config from checkpoint to UI ───────────────────────
@@ -402,7 +411,7 @@ def build_training_tab(
 
         start_btn.click(
             fn=start_and_stream,
-            inputs=[dataset_state, model_state, resume_enabled, resume_checkpoint_dd] + config_inputs,
+            inputs=[dataset_state, model_state, resume_enabled_state, resume_ckpt_path_state] + config_inputs,
             outputs=_stream_outputs,
             concurrency_limit=None,
         )
