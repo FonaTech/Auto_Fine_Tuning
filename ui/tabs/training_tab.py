@@ -28,7 +28,7 @@ def build_training_tab(
         with gr.Row():
             start_btn = gr.Button(tr("training.start"), variant="primary", scale=2)
             register_translatable(start_btn, label_key="training.start")
-            stop_btn = gr.Button(tr("training.stop"), variant="stop", scale=1, interactive=False)
+            stop_btn = gr.Button(tr("training.stop"), variant="secondary", scale=1, interactive=False)
             register_translatable(stop_btn, label_key="training.stop")
 
         # ── Status & progress ────────────────────────────────────────
@@ -122,17 +122,17 @@ def build_training_tab(
 
         def on_resume_select(ckpt_path, model_info, lora_r, lora_alpha, target_modules):
             if not ckpt_path:
-                return ""
+                return "", False
             cfg = load_checkpoint_config(ckpt_path)
             if cfg is None:
-                return "⚠️ No adapter_config.json or training_config.json found near this checkpoint"
+                return "⚠️ No adapter_config.json or training_config.json found near this checkpoint", False
             source = cfg.get("_source", "adapter_config")
             source_label = "adapter_config.json" if source == "adapter_config" else "training_config.json"
             model_id = (model_info or {}).get("model_id", "")
             modules = list(target_modules) if target_modules else []
             ok, reason = configs_compatible(cfg, model_id, int(lora_r), int(lora_alpha), modules)
             prefix = f"✅ {reason}" if ok else f"❌ {reason}"
-            return f"{prefix}  (source: {source_label})"
+            return f"{prefix}  (source: {source_label})", ok
 
         resume_scan_btn.click(
             fn=on_resume_scan,
@@ -146,7 +146,7 @@ def build_training_tab(
             inputs=[resume_checkpoint_dd, model_state,
                     config_components["lora_r"], config_components["lora_alpha"],
                     config_components["target_modules"]],
-            outputs=[resume_compat_status],
+            outputs=[resume_compat_status, resume_enabled],
         )
 
         def start_and_stream(
