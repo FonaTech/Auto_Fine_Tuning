@@ -258,6 +258,23 @@ def build_training_tab(
             outputs=_config_apply_outputs + [model_state, dataset_state, apply_config_status],
         )
 
+        # ── Button update helpers: always include translated value ───────
+        # Other buttons (scan, apply_config) work because they're never in
+        # _stream_outputs — their text is always set by build_language_update.
+        # start_btn/stop_btn ARE in _stream_outputs, so every yield must
+        # explicitly set value= or Gradio clears them to None.
+        def _start_idle():
+            return gr.update(value=t("training.start"), interactive=True)
+
+        def _start_busy():
+            return gr.update(value=t("training.start"), interactive=False)
+
+        def _stop_idle():
+            return gr.update(value=t("training.stop"), interactive=False)
+
+        def _stop_busy():
+            return gr.update(value=t("training.stop"), interactive=True)
+
         def start_and_stream(
             dataset_info, model_info, resume_on, resume_ckpt,
             lora_r, lora_alpha, lora_dropout, use_rslora,
@@ -277,11 +294,11 @@ def build_training_tab(
             orchestrator = sess.orchestrator
 
             if not dataset_info or not dataset_info.get("path"):
-                yield (_status_html("error"), gr.update(interactive=True), gr.update(interactive=False),
+                yield (_status_html("error"), _start_idle(), _stop_idle(),
                        0, t("autotune.err.no_dataset"), None, None, "—", "—", "—", "", "")
                 return
             if not model_info or not model_info.get("model_id"):
-                yield (_status_html("error"), gr.update(interactive=True), gr.update(interactive=False),
+                yield (_status_html("error"), _start_idle(), _stop_idle(),
                        0, t("autotune.err.no_model"), None, None, "—", "—", "—", "", "")
                 return
 
@@ -336,7 +353,7 @@ def build_training_tab(
             slot = session_manager.request_training(session_id)
             if slot == "queued":
                 pos = session_manager.queue_position(session_id)
-                yield (_status_html("queued"), gr.update(interactive=False), gr.update(interactive=True),
+                yield (_status_html("queued"), _start_busy(), _stop_busy(),
                        0, t("status.queued_msg").format(pos=pos), None, None, "—", "—", "—", "", "")
                 # Wait for slot
                 orchestrator._queue_event.clear()
@@ -344,13 +361,13 @@ def build_training_tab(
                     pos = session_manager.queue_position(session_id)
                     if pos == 0:
                         break
-                    yield (_status_html("queued"), gr.update(interactive=False), gr.update(interactive=True),
+                    yield (_status_html("queued"), _start_busy(), _stop_busy(),
                            0, t("status.queued_msg").format(pos=pos), None, None, "—", "—", "—", "", "")
 
             monitor.reset()
             orchestrator.start(cfg)
 
-            yield (_status_html("loading"), gr.update(interactive=False), gr.update(interactive=True),
+            yield (_status_html("loading"), _start_busy(), _stop_busy(),
                    0, t("training.status.loading"), None, None, "—", "—", "—", "", "")
 
             import pandas as pd
@@ -361,7 +378,7 @@ def build_training_tab(
                 c, total, pct = monitor.get_progress()
                 yield (
                     _status_html(monitor.status),
-                    gr.update(interactive=False), gr.update(interactive=True),
+                    _start_busy(), _stop_busy(),
                     *_poll_outputs(monitor),
                 )
                 time.sleep(2)
@@ -371,7 +388,7 @@ def build_training_tab(
             sess.status = monitor.status
             yield (
                 _status_html(monitor.status),
-                gr.update(interactive=True), gr.update(interactive=False),
+                _start_idle(), _stop_idle(),
                 *_poll_outputs(monitor),
             )
 
@@ -395,7 +412,7 @@ def build_training_tab(
             sess = session_manager.get_or_create(session_id)
             sess.orchestrator.stop()
             session_manager.on_training_done(session_id)
-            return (_status_html("stopped"), gr.update(interactive=True), gr.update(interactive=False))
+            return (_status_html("stopped"), _start_idle(), _stop_idle())
 
         stop_btn.click(fn=on_stop, inputs=[], outputs=[status_html, start_btn, stop_btn])
 
@@ -403,27 +420,25 @@ def build_training_tab(
         reconnect_trigger = gr.State(False)
 
         def reconnect_stream(should_reconnect: bool, request: gr.Request):
-            if not should_reconnect:
-                return
             session_id = getattr(request, "session_hash", "__singleton__")
             sess = session_manager.get_or_create(session_id)
             monitor = sess.monitor
-            if monitor.status not in ("loading", "running"):
-                # Not running — just show current state and return immediately (no spin)
-                yield (_status_html(monitor.status), gr.update(interactive=True), gr.update(interactive=False),
+            if not should_reconnect or monitor.status not in ("loading", "running"):
+                # Not running — always emit button text so Gradio can't clear it
+                yield (_status_html(monitor.status), _start_idle(), _stop_idle(),
                        *_poll_outputs(monitor))
                 return
-            yield (_status_html(monitor.status), gr.update(interactive=False), gr.update(interactive=True),
+            yield (_status_html(monitor.status), _start_busy(), _stop_busy(),
                    *_poll_outputs(monitor))
             while True:
                 monitor.poll()
                 if monitor.status in ("finished", "error", "stopped"):
                     break
-                yield (_status_html(monitor.status), gr.update(interactive=False), gr.update(interactive=True),
+                yield (_status_html(monitor.status), _start_busy(), _stop_busy(),
                        *_poll_outputs(monitor))
                 time.sleep(2)
             monitor.poll()
-            yield (_status_html(monitor.status), gr.update(interactive=True), gr.update(interactive=False),
+            yield (_status_html(monitor.status), _start_idle(), _stop_idle(),
                    *_poll_outputs(monitor))
 
         reconnect_trigger.change(
