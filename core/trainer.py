@@ -525,8 +525,12 @@ class TrainingOrchestrator:
                 import mlx_tune.sft_trainer as _sft_mod
                 from mlx_lm.tuner.callbacks import TrainingCallback
 
+                _reported_ckpts: set = set()
+
                 class _MLXMetricCB(TrainingCallback):
                     def on_train_loss_report(self, info: dict):
+                        if stop_event.is_set():
+                            raise KeyboardInterrupt("Training stopped by user")
                         monitor.put({
                             "type": "metrics",
                             "step": info.get("iteration", 0),
@@ -545,12 +549,20 @@ class TrainingOrchestrator:
                                 f"{info.get('tokens_per_second', 0):.0f} tok/s"
                             ),
                         })
+                        # Report any newly saved adapter files to the monitor
+                        adapters_dir = os.path.join(config.output_dir, "adapters")
+                        if os.path.isdir(adapters_dir):
+                            import glob as _glob
+                            for f in sorted(_glob.glob(os.path.join(adapters_dir, "*_adapters.safetensors"))):
+                                if f not in _reported_ckpts:
+                                    _reported_ckpts.add(f)
+                                    monitor.put({"type": "checkpoint", "path": f})
 
                     def on_val_loss_report(self, info: dict):
                         # 验证结束后主动释放 Metal 缓存，防止内存阶梯式增长
                         try:
                             import mlx.core as mx
-                            mx.metal.clear_cache()
+                            mx.clear_cache()
                         except Exception:
                             pass
 

@@ -142,7 +142,7 @@ def build_config_tab(env_info: EnvironmentInfo) -> dict:
                 components["load_in_4bit"] = gr.Checkbox(
                     value=load_in_4bit_default,
                     label=tr("config.load_in_4bit"),
-                    interactive=env_info.cuda_available,
+                    interactive=True,
                 )
                 register_translatable(components["load_in_4bit"], label_key="config.load_in_4bit")
                 components["use_gradient_checkpointing"] = gr.Checkbox(

@@ -163,6 +163,7 @@ TRANSLATIONS = {
         "training.resume.checkpoint": "选择检查点",
         "training.resume.compat": "兼容性检查",
         "training.resume.enable": "启用从检查点恢复训练",
+        "training.resume.force_sync": "强制同步检查点配置",
         "training.resume.apply_config": "回填配置到 UI",
         "training.resume.apply_config.status": "回填状态",
         "training.resume.apply_config.ok": "✅ 已回填：模型={model}，数据集={dataset}，lora_r={r}，lr={lr}",
@@ -441,6 +442,7 @@ TRANSLATIONS = {
         "training.resume.checkpoint": "選擇檢查點",
         "training.resume.compat": "相容性檢查",
         "training.resume.enable": "啟用從檢查點恢復訓練",
+        "training.resume.force_sync": "強制同步檢查點配置",
         "training.resume.apply_config": "回填配置到 UI",
         "training.resume.apply_config.status": "回填狀態",
         "training.resume.apply_config.ok": "✅ 已回填：模型={model}，資料集={dataset}，lora_r={r}，lr={lr}",
@@ -719,6 +721,7 @@ TRANSLATIONS = {
         "training.resume.checkpoint": "Select Checkpoint",
         "training.resume.compat": "Compatibility Check",
         "training.resume.enable": "Enable resume from checkpoint",
+        "training.resume.force_sync": "Force sync checkpoint config",
         "training.resume.apply_config": "Apply Config to UI",
         "training.resume.apply_config.status": "Backfill status",
         "training.resume.apply_config.ok": "✅ Applied: model={model}, dataset={dataset}, lora_r={r}, lr={lr}",
@@ -997,6 +1000,7 @@ TRANSLATIONS = {
         "training.resume.checkpoint": "チェックポイントを選択",
         "training.resume.compat": "互換性チェック",
         "training.resume.enable": "チェックポイントから訓練を再開",
+        "training.resume.force_sync": "チェックポイント設定を強制同期",
         "training.resume.apply_config": "設定を UI に適用",
         "training.resume.apply_config.status": "適用ステータス",
         "training.resume.apply_config.ok": "✅ 適用完了：モデル={model}、データセット={dataset}、lora_r={r}、lr={lr}",
@@ -1203,6 +1207,8 @@ def build_language_update(lang: str) -> list:
     """Return list of gr.update() for all registered components."""
     # These layout containers don't support label updates without re-rendering children
     _SKIP_TYPES = (gr.Tab, gr.Accordion)
+    # These interactive components must keep interactive=True after a label update
+    _ALWAYS_INTERACTIVE = (gr.Checkbox, gr.CheckboxGroup, gr.Radio)
     updates = []
     for comp, label_key, info_key, choices_key in _COMPONENT_REGISTRY:
         if isinstance(comp, _SKIP_TYPES):
@@ -1219,6 +1225,9 @@ def build_language_update(lang: str) -> list:
             kwargs["info"] = ts(info_key, lang)
         if choices_key:
             kwargs["choices"] = get_choices(choices_key, lang)
+        # Prevent Gradio from resetting interactive state on label-only updates
+        if kwargs and isinstance(comp, _ALWAYS_INTERACTIVE):
+            kwargs["interactive"] = True
         updates.append(gr.update(**kwargs) if kwargs else gr.update())
     return updates
 

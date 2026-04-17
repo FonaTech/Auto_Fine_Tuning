@@ -97,10 +97,14 @@ def build_training_tab(
                 value="", label=tr("training.resume.compat"), interactive=False,
             )
             register_translatable(resume_compat_status, label_key="training.resume.compat")
-            resume_enabled = gr.Checkbox(value=False, label=tr("training.resume.enable"))
-            register_translatable(resume_enabled, label_key="training.resume.enable")
+            with gr.Row():
+                resume_enabled = gr.Checkbox(value=False, label=tr("training.resume.enable"))
+                register_translatable(resume_enabled, label_key="training.resume.enable")
+                resume_force_sync = gr.Checkbox(value=True, label=tr("training.resume.force_sync"))
+                register_translatable(resume_force_sync, label_key="training.resume.force_sync")
             # State mirrors: accordion inputs aren't sent when accordion is closed
             resume_enabled_state = gr.State(False)
+            resume_force_sync_state = gr.State(True)
             with gr.Row():
                 apply_config_btn = gr.Button(tr("training.resume.apply_config"), variant="secondary")
                 register_translatable(apply_config_btn, label_key="training.resume.apply_config")
@@ -128,9 +132,12 @@ def build_training_tab(
         def on_resume_scan(scan_dir, model_info, lora_r, lora_alpha, target_modules):
             found = scan_checkpoints(scan_dir.strip() or "outputs")
             if not found:
-                return gr.update(choices=[], value=None), t("training.resume.scan") + ": 0"
+                return gr.update(choices=[], value=None), t("training.resume.scan") + ": 0", "", False, ""
             labels = [(c.label, c.path) for c in found]
-            return gr.update(choices=labels, value=found[-1].path), f"Found {len(found)}"
+            best_path = found[-1].path
+            # Run compat check on the best checkpoint immediately (Gradio won't fire .change)
+            compat_text, is_ok = on_resume_select(best_path, model_info, lora_r, lora_alpha, target_modules)
+            return gr.update(choices=labels, value=best_path), compat_text, best_path, is_ok, best_path
 
         def on_resume_select(ckpt_path, model_info, lora_r, lora_alpha, target_modules):
             if not ckpt_path:
@@ -141,8 +148,21 @@ def build_training_tab(
             source = cfg.get("_source", "adapter_config")
             source_label = "adapter_config.json" if source == "adapter_config" else "training_config.json"
             model_id = (model_info or {}).get("model_id", "")
-            modules = list(target_modules) if target_modules else []
-            ok, reason = configs_compatible(cfg, model_id, int(lora_r), int(lora_alpha), modules)
+
+            if not model_id:
+                # No model loaded in UI — compare checkpoint against its own config
+                # so it's always self-compatible; UI values will be filled by Apply Config
+                cmp_model = cfg.get("base_model_name_or_path", "")
+                cmp_r = int(cfg.get("r") or lora_r)
+                cmp_alpha = int(cfg.get("lora_alpha") or lora_alpha)
+                cmp_modules = cfg.get("target_modules") or (list(target_modules) if target_modules else [])
+            else:
+                cmp_model = model_id
+                cmp_r = int(lora_r)
+                cmp_alpha = int(lora_alpha)
+                cmp_modules = list(target_modules) if target_modules else []
+
+            ok, reason = configs_compatible(cfg, cmp_model, cmp_r, cmp_alpha, cmp_modules)
             prefix = f"✅ {reason}" if ok else f"❌ {reason}"
             return f"{prefix}  (source: {source_label})", ok
 
@@ -151,8 +171,12 @@ def build_training_tab(
             inputs=[resume_scan_dir, model_state,
                     config_components["lora_r"], config_components["lora_alpha"],
                     config_components["target_modules"]],
-            outputs=[resume_checkpoint_dd, resume_compat_status],
+            outputs=[resume_checkpoint_dd, resume_compat_status, resume_ckpt_path_state, resume_enabled, resume_enabled_state],
         )
+
+        # Keep State mirrors in sync
+        resume_enabled.change(fn=lambda v: v, inputs=[resume_enabled], outputs=[resume_enabled_state])
+        resume_force_sync.change(fn=lambda v: v, inputs=[resume_force_sync], outputs=[resume_force_sync_state])
 
         def _on_resume_dd_change(ckpt_path, model_info, lora_r, lora_alpha, target_modules):
             """Wraps on_resume_select and also updates the mirror State."""
@@ -285,7 +309,7 @@ def build_training_tab(
             return gr.update(value=t("training.stop"), interactive=True)
 
         def start_and_stream(
-            dataset_info, model_info, resume_on, resume_ckpt,
+            dataset_info, model_info, resume_on, resume_ckpt, resume_force_sync,
             lora_r, lora_alpha, lora_dropout, use_rslora,
             target_modules, training_type, num_epochs,
             batch_size, grad_accum,
@@ -301,6 +325,47 @@ def build_training_tab(
             sess = session_manager.get_or_create(session_id)
             monitor = sess.monitor
             orchestrator = sess.orchestrator
+
+            # Force-sync: override UI config values from checkpoint's training_config.json
+            if resume_on and resume_ckpt and resume_force_sync:
+                tc = load_training_config_raw(resume_ckpt)
+                if tc:
+                    lora_r = tc.get("lora_r", lora_r)
+                    lora_alpha = tc.get("lora_alpha", lora_alpha)
+                    lora_dropout = tc.get("lora_dropout", lora_dropout)
+                    use_rslora = tc.get("use_rslora", use_rslora)
+                    target_modules = tc.get("target_modules", target_modules)
+                    training_type = tc.get("training_type", training_type)
+                    num_epochs = tc.get("num_epochs", num_epochs)
+                    batch_size = tc.get("per_device_train_batch_size", batch_size)
+                    grad_accum = tc.get("gradient_accumulation_steps", grad_accum)
+                    learning_rate = str(tc.get("learning_rate", learning_rate))
+                    lr_scheduler = tc.get("lr_scheduler_type", lr_scheduler)
+                    warmup_ratio = tc.get("warmup_ratio", warmup_ratio)
+                    weight_decay = tc.get("weight_decay", weight_decay)
+                    max_grad_norm = tc.get("max_grad_norm", max_grad_norm)
+                    beta = tc.get("beta", beta)
+                    load_in_4bit = tc.get("load_in_4bit", load_in_4bit)
+                    use_gc = tc.get("use_gradient_checkpointing", use_gc)
+                    packing = tc.get("packing", packing)
+                    max_seq_length = tc.get("max_seq_length", max_seq_length)
+                    neftune = tc.get("neftune_noise_alpha", neftune)
+                    output_dir = tc.get("output_dir", output_dir)
+                    save_steps = tc.get("save_steps", save_steps)
+                    save_total_limit = tc.get("save_total_limit", save_total_limit)
+                    logging_steps = tc.get("logging_steps", logging_steps)
+                    report_to = tc.get("report_to", report_to)
+                    if tc.get("model_id"):
+                        model_info = {**(model_info or {}), "model_id": tc["model_id"]}
+                    if tc.get("dataset_path"):
+                        # Preserve user's max_samples/train_ratio — only sync path/template/think_mode
+                        cur = dataset_info or {}
+                        dataset_info = {
+                            **cur,
+                            "path": tc["dataset_path"],
+                            "template": tc.get("prompt_template", cur.get("template", "alpaca")),
+                            "think_mode": tc.get("think_mode", cur.get("think_mode", "keep")),
+                        }
 
             if not dataset_info or not dataset_info.get("path"):
                 yield (_status_html("error"), _start_idle(), _stop_idle(),
@@ -411,7 +476,7 @@ def build_training_tab(
 
         start_btn.click(
             fn=start_and_stream,
-            inputs=[dataset_state, model_state, resume_enabled_state, resume_ckpt_path_state] + config_inputs,
+            inputs=[dataset_state, model_state, resume_enabled_state, resume_ckpt_path_state, resume_force_sync_state] + config_inputs,
             outputs=_stream_outputs,
             concurrency_limit=None,
         )

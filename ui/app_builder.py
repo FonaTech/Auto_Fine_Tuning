@@ -139,14 +139,14 @@ def build_app() -> gr.Blocks:
                 build_dataset_tab(dataset_state)
                 build_model_tab(model_state, env_info)
                 config_components = build_config_tab(env_info)
-                reconnect_trigger = build_training_tab(
-                    config_components, dataset_state, model_state,
-                )
-                build_export_tab()
                 build_auto_tune_tab(
                     dataset_state, model_state,
                     config_components,
                 )
+                reconnect_trigger = build_training_tab(
+                    config_components, dataset_state, model_state,
+                )
+                build_export_tab()
 
             gr.Markdown(
                 "This project is a local single-user fine-tuning GUI. See README, LICENSE, and THIRD_PARTY_NOTICES for dependency licenses and attribution details.",

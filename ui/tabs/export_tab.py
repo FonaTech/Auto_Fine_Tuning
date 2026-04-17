@@ -35,13 +35,13 @@ def build_export_tab() -> None:
             register_translatable(export_lora, label_key="export.lora")
             export_merged = gr.Checkbox(value=False, label=tr("export.merged"))
             register_translatable(export_merged, label_key="export.merged")
-            export_gguf = gr.Checkbox(value=False, label=tr("export.gguf"))
+            export_gguf = gr.Checkbox(value=True, label=tr("export.gguf"))
             register_translatable(export_gguf, label_key="export.gguf")
 
         with gr.Row(visible=True) as gguf_options:
             gguf_quant_dd = gr.Dropdown(
                 choices=list(GGUF_QUANTIZATIONS.keys()),
-                value="q4_k_m",
+                value="q8_0",
                 label=tr("export.gguf_quant"),
             )
             register_translatable(gguf_quant_dd, label_key="export.gguf_quant")
@@ -143,42 +143,126 @@ def build_export_tab() -> None:
             monitor = sess.monitor
 
             if orchestrator._model is None:
-                return "❌ Model not loaded. Please complete training first."
+                yield "❌ Model not loaded. Please complete training first."
+                return
 
             if not ckpt_path:
                 ckpts = monitor.get_checkpoints()
                 if not ckpts:
-                    return "❌ No checkpoints found. Please complete training first."
+                    yield "❌ No checkpoints found. Please complete training first."
+                    return
                 ckpt_path = ckpts[-1]
 
             model = orchestrator._model
             tokenizer = orchestrator._tokenizer
             logs = []
-            base_dir = os.path.join(ckpt_path, out_subdir or "exported")
 
-            try:
-                if do_lora:
-                    from core.exporter import save_lora_adapter
-                    out = save_lora_adapter(model, tokenizer, os.path.join(base_dir, "lora"), logs.append)
-                    logs.append(f"✅ LoRA adapter: {out}")
-                if do_merged:
-                    from core.exporter import save_merged_model
-                    out = save_merged_model(model, tokenizer, os.path.join(base_dir, "merged"), logs.append)
-                    logs.append(f"✅ Merged model: {out}")
-                if do_gguf:
-                    from core.exporter import save_gguf
-                    out = save_gguf(model, tokenizer, os.path.join(base_dir, "gguf"), gguf_quant, logs.append)
-                    logs.append(f"✅ GGUF: {out}")
-            except Exception as e:
-                logs.append(f"❌ Export failed: {e}")
+            def _emit(msg):
+                logs.append(msg)
 
-            return "\n".join(logs)
+            is_mlx = ckpt_path.endswith(".safetensors") and os.path.isfile(ckpt_path)
+            ckpt_base = ckpt_path if os.path.isdir(ckpt_path) else os.path.dirname(ckpt_path)
+            base_dir = os.path.join(ckpt_base, out_subdir or "exported")
+            os.makedirs(base_dir, exist_ok=True)
+
+            import threading
+            done = threading.Event()
+            error = [None]
+
+            def _run():
+                try:
+                    if is_mlx:
+                        from core.checkpoint import load_training_config_raw
+                        from core.exporter import (
+                            save_lora_adapter_mlx, save_merged_model_mlx, save_gguf_mlx,
+                        )
+                        tc = load_training_config_raw(ckpt_path) or {}
+                        model_id = tc.get("model_id", "") or getattr(orchestrator, "_model_id", "")
+                        adapters_dir = ckpt_base
+
+                        if do_lora:
+                            out = save_lora_adapter_mlx(ckpt_path, adapters_dir,
+                                os.path.join(base_dir, "lora"), tc, _emit)
+                            _emit(f"✅ LoRA adapter: {out}")
+                        if do_merged:
+                            if not model_id:
+                                _emit("❌ Merged: model_id not found in training_config.json")
+                            else:
+                                out = save_merged_model_mlx(model_id, ckpt_path, adapters_dir,
+                                    os.path.join(base_dir, "merged"), tc, _emit)
+                                _emit(f"✅ Merged model: {out}")
+                        if do_gguf:
+                            if not model_id:
+                                _emit("❌ GGUF: model_id not found in training_config.json")
+                            else:
+                                out = save_gguf_mlx(model_id, ckpt_path, adapters_dir,
+                                    os.path.join(base_dir, "gguf", "model.gguf"), tc, gguf_quant, _emit)
+                                _emit(f"✅ GGUF: {out}")
+                    else:
+                        if do_lora:
+                            from core.exporter import save_lora_adapter
+                            out = save_lora_adapter(model, tokenizer,
+                                os.path.join(base_dir, "lora"), _emit)
+                            _emit(f"✅ LoRA adapter: {out}")
+                        if do_merged:
+                            from core.exporter import save_merged_model
+                            out = save_merged_model(model, tokenizer,
+                                os.path.join(base_dir, "merged"), _emit)
+                            _emit(f"✅ Merged model: {out}")
+                        if do_gguf:
+                            from core.exporter import save_gguf
+                            out = save_gguf(model, tokenizer,
+                                os.path.join(base_dir, "gguf"), gguf_quant, _emit)
+                            _emit(f"✅ GGUF: {out}")
+                except Exception as e:
+                    error[0] = e
+                finally:
+                    done.set()
+
+            import time
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            last_len = 0
+            while not done.is_set():
+                time.sleep(0.5)
+                if len(logs) > last_len:
+                    last_len = len(logs)
+                    yield "\n".join(logs), ""
+            if error[0]:
+                logs.append(f"❌ Export failed: {error[0]}")
+            gguf_out = next((l.split(": ", 1)[1] for l in reversed(logs)
+                             if l.startswith("✅ GGUF:")), "")
+            yield "\n".join(logs), gguf_out
+
+        # State to track last exported GGUF path for inference
+        last_gguf_path = gr.State("")
 
         export_btn.click(
             fn=do_export,
             inputs=[checkpoint_dd, export_lora, export_merged,
                     export_gguf, gguf_quant_dd, export_output_dir],
-            outputs=[export_log],
+            outputs=[export_log, last_gguf_path],
+        )
+
+        def do_inference(prompt, max_tokens, temp, gguf_path, request: gr.Request):
+            session_id = getattr(request, "session_hash", "__singleton__")
+            orchestrator = session_manager.get_or_create(session_id).orchestrator
+            if not prompt.strip():
+                return "❌ Please enter a prompt"
+            from core.exporter import run_inference
+            try:
+                return run_inference(
+                    orchestrator._model, orchestrator._tokenizer,
+                    prompt.strip(), int(max_tokens), float(temp),
+                    gguf_path=gguf_path or None,
+                )
+            except Exception as e:
+                return f"❌ Inference failed: {e}"
+
+        infer_btn.click(
+            fn=do_inference,
+            inputs=[infer_input, infer_max_tokens, infer_temp, last_gguf_path],
+            outputs=[infer_output],
         )
 
         def do_hub_push(repo_id, token, private, request: gr.Request):
@@ -198,23 +282,3 @@ def build_export_tab() -> None:
                 return f"❌ {e}"
 
         hub_push_btn.click(fn=do_hub_push, inputs=[hub_repo_id, hub_token, hub_private], outputs=[hub_status])
-
-        def do_inference(prompt, max_tokens, temp, request: gr.Request):
-            session_id = getattr(request, "session_hash", "__singleton__")
-            orchestrator = session_manager.get_or_create(session_id).orchestrator
-            if orchestrator._model is None:
-                return "❌ Model not loaded. Please complete training first."
-            if not prompt.strip():
-                return "❌ Please enter a prompt"
-            from core.exporter import run_inference
-            try:
-                return run_inference(orchestrator._model, orchestrator._tokenizer,
-                                     prompt.strip(), int(max_tokens), float(temp))
-            except Exception as e:
-                return f"❌ Inference failed: {e}"
-
-        infer_btn.click(
-            fn=do_inference,
-            inputs=[infer_input, infer_max_tokens, infer_temp],
-            outputs=[infer_output],
-        )
