@@ -801,23 +801,48 @@ class TrainingOrchestrator:
                 del batch_samples
                 eval_ds = None
 
-                # Round budget: do `num_epochs` passes over the consumed
-                # window per round, capped by rejection refresh cadence and
-                # the remaining total step budget. MLX/HF trainers are forced
-                # to exactly `round_steps` optimiser steps via max_steps, so
-                # global_step accounting matches what actually ran.
+                # Expected optimiser steps this round = num_epochs passes
+                # over the consumed window, with the user-configured batch.
+                # This is our best a-priori estimate; we let the trainer run
+                # its natural iter count (do NOT pass a max_steps cap) so
+                # mlx_tune's in-loop "Step N/M | Loss:" print is reached
+                # and the loss curve callback keeps firing.
+                expected_iters = max(
+                    1,
+                    consumed_n * max(1, config.num_epochs) // eff_batch,
+                )
                 round_steps = min(
                     config.rejection_refresh_steps if config.rejection_refresh_steps > 0 else steps_per_epoch,
                     total_steps - global_step,
-                    max(1, consumed_n * max(1, config.num_epochs) // eff_batch),
+                    expected_iters,
                 )
 
-                # Build and run trainer for this round
+                # Auto-scale logging_steps so mlx_tune actually emits at
+                # least one "Step N/M | Loss:" line per round (which the
+                # `_capturing_print` hook in _run_mlx_training parses into
+                # metrics for the live loss / LR curves).
+                orig_logging_steps = config.logging_steps
+                round_logging = max(1, min(orig_logging_steps, expected_iters // 2 or 1))
+                config.logging_steps = round_logging
+
+                # Build and run trainer for this round (no max_steps override —
+                # let the trainer's natural iter count drive mlx_tune's
+                # logging_steps cadence).
                 callback = MetricsCallback(self.monitor, self._stop_event, config)
                 trainer = self._build_trainer(
                     config, backend, model, tokenizer,
-                    train_ds, eval_ds, callback, round_steps
+                    train_ds, eval_ds, callback, 0
                 )
+                # Restore user-configured logging_steps on the Python object
+                # (the trainer has captured the value it needs already).
+                config.logging_steps = orig_logging_steps
+
+                # Resolve actual iter count the trainer will execute — MLX
+                # exposes `self.iters`; HF Trainer we fall back to the
+                # estimate. This keeps global_step aligned with real work.
+                actual_iters = getattr(trainer, "iters", None)
+                if not isinstance(actual_iters, int) or actual_iters <= 0:
+                    actual_iters = round_steps
 
                 if backend == "mlx":
                     self._run_mlx_training(config, model, trainer)
@@ -845,11 +870,11 @@ class TrainingOrchestrator:
                     except Exception:
                         pass
 
-                global_step += round_steps
+                global_step += actual_iters
                 monitor.put({"type": "log",
                              "line": (f"Dynamic training round complete: "
                                       f"step {global_step}/{total_steps} "
-                                      f"(+{round_steps} steps this round; "
+                                      f"(+{actual_iters} steps this round; "
                                       f"consumed {consumed_n} samples; "
                                       f"buffer remaining: {dataset.peek_ready_count()})")})
 
