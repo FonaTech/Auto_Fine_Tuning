@@ -147,6 +147,12 @@ class AutoTuner:
         target_modules: Optional[List[str]] = None,
         output_dir: str = "auto_tune_cache",
         seed: int = 42,
+        training_type: str = "sft",
+        auto_generate_rejected: bool = True,
+        rejection_max_tokens: int = 512,
+        rejection_temperature: float = 0.7,
+        beta: float = 0.1,
+        aggressive_memory_save: bool = False,
     ) -> None:
         if self.is_running():
             raise RuntimeError("自动优化已在运行中，请先停止。")
@@ -179,6 +185,12 @@ class AutoTuner:
             ],
             output_dir=output_dir,
             seed=seed,
+            training_type=training_type,
+            auto_generate_rejected=auto_generate_rejected,
+            rejection_max_tokens=rejection_max_tokens,
+            rejection_temperature=rejection_temperature,
+            beta=beta,
+            aggressive_memory_save=aggressive_memory_save,
         )
         self._thread = threading.Thread(
             target=self._run, kwargs=kwargs, daemon=True, name="auto-tune-thread"
@@ -214,6 +226,12 @@ class AutoTuner:
         load_in_4bit, max_seq_length,
         base_lora_r, base_lora_alpha, base_lora_dropout, target_modules,
         output_dir, seed,
+        training_type="sft",
+        auto_generate_rejected=True,
+        rejection_max_tokens=512,
+        rejection_temperature=0.7,
+        beta=0.1,
+        aggressive_memory_save=False,
     ) -> None:
         self._put({"type": "log", "line": "=== 自动优化开始 ==="})
         start_time = time.time()
@@ -221,10 +239,17 @@ class AutoTuner:
         try:
             # ── 1. 加载数据集 ──────────────────────────────────────
             self._put({"type": "log", "line": f"加载数据集: {dataset_path}"})
-            train_records = self._load_probe_dataset(
-                dataset_path, train_ratio, probe_samples, prompt_template, think_mode
+            train_records, data_flavor = self._load_probe_dataset(
+                dataset_path, train_ratio, probe_samples, prompt_template, think_mode,
+                training_type=training_type,
+                auto_generate_rejected=auto_generate_rejected,
+                model_id=model_id,
+                rejection_max_tokens=rejection_max_tokens,
+                rejection_temperature=rejection_temperature,
+                output_dir=output_dir,
             )
-            self._put({"type": "log", "line": f"探针数据集: {len(train_records)} 条"})
+            self._put({"type": "log",
+                       "line": f"探针数据集: {len(train_records)} 条 (flavor={data_flavor})"})
 
             # ── 2. 加载基础模型（所有 trial 共享，避免重复加载）────
             self._put({"type": "status", "status": "loading"})
@@ -276,6 +301,8 @@ class AutoTuner:
                         train_records, params,
                         max_seq_length, base_lora_dropout, target_modules,
                         probe_steps, output_dir, trial.number, trial, seed,
+                        training_type=training_type, data_flavor=data_flavor, beta=beta,
+                        aggressive_memory_save=aggressive_memory_save,
                     )
                     status = "complete"
                 except optuna.exceptions.TrialPruned:
@@ -385,14 +412,106 @@ class AutoTuner:
 
     def _load_probe_dataset(
         self, path: str, train_ratio: float,
-        probe_samples: int, template: str, think_mode: str
+        probe_samples: int, template: str, think_mode: str,
+        training_type: str = "sft",
+        auto_generate_rejected: bool = True,
+        model_id: str = "",
+        rejection_max_tokens: int = 512,
+        rejection_temperature: float = 0.7,
+        output_dir: str = "auto_tune_cache",
     ):
-        from core.dataset import load_raw, split_records, format_dataset_sft
+        """Load a probe dataset shaped for the requested training_type.
+
+        Returns `(records, flavor)` where flavor is one of:
+          - "sft"                → records have a "text" field
+          - "preference_native"  → records have prompt/chosen/rejected
+          - "preference_cached"  → same as native, but auto-generated once
+                                    and cached at <output_dir>/probe_preference.jsonl
+        """
+        from core.dataset import (
+            load_raw, split_records, format_dataset_sft,
+            sft_to_preference_prompts, detect_dataset_type,
+        )
+        import os as _os
+        import json as _json
+
         records = load_raw(path)
         train_recs, _ = split_records(records, train_ratio)
-        # 取探针子集
         recs = train_recs[:probe_samples] if probe_samples > 0 else train_recs
-        return format_dataset_sft(recs, template, think_mode, "</s>")
+
+        if training_type == "sft":
+            return format_dataset_sft(recs, template, think_mode, "</s>"), "sft"
+
+        # DPO / ORPO probe
+        if detect_dataset_type(recs) == "preference":
+            pairs = [
+                {"prompt": r.get("prompt", ""),
+                 "chosen": r.get("chosen", ""),
+                 "rejected": r.get("rejected", "")}
+                for r in recs
+                if str(r.get("chosen", "")).strip() and str(r.get("rejected", "")).strip()
+            ]
+            return pairs, "preference_native"
+
+        if not auto_generate_rejected:
+            raise ValueError(
+                f"{training_type.upper()} auto-tune requires preference data but the dataset "
+                f"is SFT-style and auto_generate_rejected is disabled."
+            )
+
+        # SFT → synchronously pre-generate rejected for the probe subset, cache once.
+        _os.makedirs(output_dir, exist_ok=True)
+        cache_path = _os.path.join(output_dir, "probe_preference.jsonl")
+        if _os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = [_json.loads(l) for l in f if l.strip()]
+                if len(cached) >= len(recs) * 0.8:  # reuse if sufficiently covered
+                    self._put({"type": "log",
+                               "line": f"[auto-tune] reusing cached probe preference "
+                                       f"dataset ({len(cached)} samples) -> {cache_path}"})
+                    return cached[: len(recs) if probe_samples > 0 else len(cached)], "preference_cached"
+            except Exception:
+                pass
+
+        self._put({"type": "log",
+                   "line": f"[auto-tune] generating {len(recs)} rejected samples for probe..."})
+        from core.rejection_generator import RejectionGenerator
+        prompts = sft_to_preference_prompts(recs, template, think_mode)
+        generator = RejectionGenerator(
+            model_path=model_id,
+            backend="mlx",  # subprocess auto-falls-back
+            max_tokens=rejection_max_tokens,
+            temperature=rejection_temperature,
+            log_fn=lambda m: self._put({"type": "log", "line": m}),
+        )
+        out_pairs = []
+        try:
+            generator.start()
+            for i, item in enumerate(prompts):
+                if self._stop_event.is_set():
+                    break
+                try:
+                    rj = generator.generate(item["prompt"])
+                except Exception as e:
+                    self._put({"type": "log", "line": f"[auto-tune] gen err {i}: {e}"})
+                    continue
+                out_pairs.append({"prompt": item["prompt"],
+                                  "chosen": item["chosen"], "rejected": rj})
+                if (i + 1) % 10 == 0:
+                    self._put({"type": "log",
+                               "line": f"[auto-tune] rejected gen {i+1}/{len(prompts)}"})
+        finally:
+            generator.stop()
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                for rec in out_pairs:
+                    f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+            self._put({"type": "log",
+                       "line": f"[auto-tune] cached probe preference -> {cache_path}"})
+        except Exception:
+            pass
+        return out_pairs, "preference_cached"
 
     # ── Model loading ─────────────────────────────────────────────
 
@@ -472,6 +591,9 @@ class AutoTuner:
         trial_num: int,
         trial: "optuna.Trial",
         seed: int,
+        training_type: str = "sft",
+        data_flavor: str = "sft",
+        beta: float = 0.1,
     ) -> float:
         """在探针数据集上运行 probe_steps 步，返回训练损失。"""
         import torch
@@ -494,6 +616,8 @@ class AutoTuner:
                 base_model, tokenizer, train_records, params,
                 max_seq_length, target_modules, probe_steps,
                 trial_output_dir, trial_num, trial, seed,
+                training_type=training_type, data_flavor=data_flavor, beta=beta,
+                aggressive_memory_save=aggressive_memory_save,
             )
 
         train_ds = HFDataset.from_list(train_records)
@@ -548,9 +672,6 @@ class AutoTuner:
             report_to="none",
         )
 
-        # ── SFTTrainer ─────────────────────────────────────────────
-        from trl import SFTTrainer
-
         # Optuna 中间值回调（支持 MedianPruner）
         step_losses: list = []
 
@@ -564,16 +685,66 @@ class AutoTuner:
                     if trial.should_prune():
                         control.should_training_stop = True
 
-        trainer = SFTTrainer(
-            model=model_with_lora,
-            tokenizer=tokenizer,
-            train_dataset=train_ds,
-            dataset_text_field="text",
-            max_seq_length=max_seq_length,
-            packing=False,
-            args=training_args,
-            callbacks=[_PruneCallback()],
-        )
+        # ── Trainer dispatch (SFT / DPO / ORPO) ───────────────────
+        if training_type == "sft":
+            from trl import SFTTrainer
+            trainer = SFTTrainer(
+                model=model_with_lora,
+                tokenizer=tokenizer,
+                train_dataset=train_ds,
+                dataset_text_field="text",
+                max_seq_length=max_seq_length,
+                packing=False,
+                args=training_args,
+                callbacks=[_PruneCallback()],
+            )
+        elif training_type == "orpo":
+            from trl import ORPOTrainer, ORPOConfig
+            orpo_batch = max(1, batch_size // 2) if aggressive_memory_save else batch_size
+            orpo_accum = grad_accum * 2 if aggressive_memory_save else grad_accum
+            orpo_max_len = min(max_seq_length, 1024) if aggressive_memory_save else max_seq_length
+            orpo_args = ORPOConfig(
+                per_device_train_batch_size=orpo_batch,
+                gradient_accumulation_steps=orpo_accum,
+                max_steps=probe_steps,
+                learning_rate=lr,
+                warmup_ratio=warmup_ratio,
+                lr_scheduler_type=scheduler,
+                fp16=use_fp16, bf16=use_bf16,
+                optim=optim,
+                logging_steps=max(1, probe_steps // 10),
+                save_steps=99999,
+                seed=seed,
+                dataloader_num_workers=0,
+                remove_unused_columns=True,
+                output_dir=trial_output_dir,
+                beta=beta,
+                max_length=orpo_max_len,
+                max_prompt_length=orpo_max_len // 2,
+                report_to="none",
+            )
+            trainer = ORPOTrainer(
+                model=model_with_lora,
+                args=orpo_args,
+                train_dataset=train_ds,
+                tokenizer=tokenizer,
+                callbacks=[_PruneCallback()],
+            )
+        elif training_type == "dpo":
+            from trl import DPOTrainer
+            dpo_max_len = min(max_seq_length, 1024) if aggressive_memory_save else max_seq_length
+            trainer = DPOTrainer(
+                model=model_with_lora,
+                ref_model=None,
+                args=training_args,
+                beta=beta,
+                train_dataset=train_ds,
+                tokenizer=tokenizer,
+                max_length=dpo_max_len,
+                callbacks=[_PruneCallback()],
+            )
+        else:
+            raise ValueError(f"unsupported training_type: {training_type}")
 
         train_result = trainer.train()
         final_loss = train_result.training_loss
@@ -601,8 +772,20 @@ class AutoTuner:
         params: dict, max_seq_length: int, target_modules: list,
         probe_steps: int, trial_output_dir: str, trial_num: int,
         trial, seed: int,
+        training_type: str = "sft",
+        data_flavor: str = "sft",
+        beta: float = 0.1,
+        aggressive_memory_save: bool = False,
     ) -> float:
-        """MLX backend 探针训练：使用 mlx_tune SFTTrainer 运行短训练。"""
+        """MLX backend 探针训练：SFT / DPO / ORPO。"""
+        # Apply memory-saving mlx_tune monkey-patches (logsumexp + clear_cache)
+        try:
+            from core.mlx_patches import apply_mlx_tune_patches
+            apply_mlx_tune_patches(
+                log_fn=lambda m: self._put({"type": "log", "line": m})
+            )
+        except Exception:
+            pass
         from mlx_tune import FastLanguageModel, SFTTrainer, SFTConfig
 
         lora_r = params["lora_r"]
@@ -647,26 +830,75 @@ class AutoTuner:
 
             _sft_mod.mlx_train = _patched
 
-            args = SFTConfig(
-                output_dir=trial_output_dir,
-                per_device_train_batch_size=batch_size,
-                learning_rate=lr,
-                lr_scheduler_type=scheduler,
-                warmup_ratio=warmup_ratio,
-                max_steps=probe_steps,
-                logging_steps=max(1, probe_steps // 10),
-                save_steps=99999,
-                max_seq_length=max_seq_length,
-                use_native_training=True,
-            )
-
-            trainer = SFTTrainer(
-                model=model_with_lora,
-                tokenizer=tokenizer,
-                train_dataset=train_records,
-                args=args,
-                dataset_text_field="text",
-            )
+            if training_type == "sft":
+                args = SFTConfig(
+                    output_dir=trial_output_dir,
+                    per_device_train_batch_size=batch_size,
+                    learning_rate=lr,
+                    lr_scheduler_type=scheduler,
+                    warmup_ratio=warmup_ratio,
+                    max_steps=probe_steps,
+                    logging_steps=max(1, probe_steps // 10),
+                    save_steps=99999,
+                    max_seq_length=max_seq_length,
+                    use_native_training=True,
+                )
+                trainer = SFTTrainer(
+                    model=model_with_lora,
+                    tokenizer=tokenizer,
+                    train_dataset=train_records,
+                    args=args,
+                    dataset_text_field="text",
+                )
+            elif training_type == "orpo":
+                from mlx_tune import ORPOTrainer, ORPOConfig
+                pref_max_seq = (min(max_seq_length, 1024)
+                                if aggressive_memory_save else max_seq_length)
+                pref_batch = (max(1, batch_size // 2)
+                              if aggressive_memory_save else batch_size)
+                args = ORPOConfig(
+                    beta=beta,
+                    output_dir=trial_output_dir,
+                    learning_rate=lr,
+                    per_device_train_batch_size=pref_batch,
+                    num_train_epochs=1,
+                    logging_steps=max(1, probe_steps // 10),
+                    save_steps=99999,
+                    max_seq_length=pref_max_seq,
+                    max_prompt_length=pref_max_seq // 2,
+                )
+                trainer = ORPOTrainer(
+                    model=model_with_lora,
+                    train_dataset=train_records,
+                    tokenizer=tokenizer,
+                    args=args,
+                )
+            elif training_type == "dpo":
+                from mlx_tune import DPOTrainer, DPOConfig
+                pref_max_seq = (min(max_seq_length, 1024)
+                                if aggressive_memory_save else max_seq_length)
+                pref_batch = (max(1, batch_size // 2)
+                              if aggressive_memory_save else batch_size)
+                args = DPOConfig(
+                    beta=beta,
+                    output_dir=trial_output_dir,
+                    learning_rate=lr,
+                    per_device_train_batch_size=pref_batch,
+                    num_train_epochs=1,
+                    logging_steps=max(1, probe_steps // 10),
+                    save_steps=99999,
+                    max_seq_length=pref_max_seq,
+                    max_prompt_length=pref_max_seq // 2,
+                )
+                trainer = DPOTrainer(
+                    model=model_with_lora,
+                    train_dataset=train_records,
+                    ref_model=None,
+                    tokenizer=tokenizer,
+                    args=args,
+                )
+            else:
+                raise ValueError(f"unsupported training_type: {training_type}")
             trainer.train()
 
         finally:

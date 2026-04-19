@@ -49,10 +49,11 @@ def _hero_html(env_info) -> str:
     return (
         "<div class='app-header'>"
         "<div class='app-header-kicker'>Local Fine-Tuning Workbench</div>"
-        "<h1 class='app-header-title'>Unsloth GUI Fine-Tuning Workbench</h1>"
+        "<h1 class='app-header-title'>Auto_Fine_Tuning</h1>"
         "<p class='app-header-subtitle'>"
-        "Train and experiment with SFT, DPO, ORPO, auto tuning, model export, "
-        "and quick inference from one local web interface."
+        "SFT · DPO · Auto-ORPO — automatic preference synthesis, "
+        "dynamic or pre-generate rejection modes, and Optuna auto hyperparameter search "
+        "from one local web interface."
         "</p>"
         "<div class='app-meta-line'>"
         f"<span class='app-meta-chip'><span class='app-meta-chip-label'>Backend</span><span class='app-meta-chip-value'>{backend_label}</span></span>"
@@ -82,7 +83,7 @@ def build_app() -> gr.Blocks:
     env_info = get_env_info()
 
     with gr.Blocks(
-        title="Unsloth GUI Fine-Tuning Workbench",
+        title="Auto_Fine_Tuning — SFT · DPO · Auto-ORPO",
         fill_width=True,
     ) as app:
         with gr.Column(elem_id="app-shell", elem_classes="app-shell"):
@@ -149,7 +150,7 @@ def build_app() -> gr.Blocks:
                 build_export_tab()
 
             gr.Markdown(
-                "This project is a local single-user fine-tuning GUI. See README, LICENSE, and THIRD_PARTY_NOTICES for dependency licenses and attribution details.",
+                "This project is a local single-user fine-tuning system. See README, LICENSE, and THIRD_PARTY_NOTICES for dependency licenses and attribution details.",
                 elem_classes="footer-note",
             )
 

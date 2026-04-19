@@ -165,6 +165,15 @@ def build_config_tab(env_info: EnvironmentInfo) -> dict:
                     label=tr("config.neftune"),
                 )
                 register_translatable(components["neftune_noise_alpha"], label_key="config.neftune")
+            with gr.Row():
+                components["aggressive_memory_save"] = gr.Checkbox(
+                    value=False,
+                    label=tr("config.aggressive_memory_save"),
+                    info=tr("config.aggressive_memory_save.info"),
+                )
+                register_translatable(components["aggressive_memory_save"],
+                                      label_key="config.aggressive_memory_save",
+                                      info_key="config.aggressive_memory_save.info")
 
         # ── 保存与日志 ───────────────────────────────────────────────
         with gr.Accordion(tr("config.accordion.save"), open=False) as acc_save:
@@ -194,6 +203,47 @@ def build_config_tab(env_info: EnvironmentInfo) -> dict:
                 )
                 register_translatable(components["report_to"], label_key="config.report_to")
 
+        # ── ORPO/DPO 自动生成设置 ──────────────────────────────────
+        with gr.Accordion(tr("config.accordion.auto_reject"), open=False, visible=False) as acc_auto_reject:
+            register_translatable(acc_auto_reject, label_key="config.accordion.auto_reject")
+            gr.Markdown(tr("config.auto_reject.desc"))
+            with gr.Row():
+                components["rejection_mode"] = gr.Radio(
+                    choices=["dynamic", "pre_generate"],
+                    value="dynamic",
+                    label=tr("config.rejection_mode"),
+                    info=tr("config.rejection_mode.info"),
+                )
+                register_translatable(components["rejection_mode"],
+                                      label_key="config.rejection_mode",
+                                      info_key="config.rejection_mode.info")
+            with gr.Row():
+                components["rejection_refresh_steps"] = gr.Number(
+                    value=1000, label=tr("config.rejection_refresh_steps"),
+                    precision=0, info=tr("config.rejection_refresh_steps.info"),
+                )
+                register_translatable(components["rejection_refresh_steps"],
+                                      label_key="config.rejection_refresh_steps",
+                                      info_key="config.rejection_refresh_steps.info")
+                components["rejection_refresh_epochs"] = gr.Checkbox(
+                    value=True, label=tr("config.rejection_refresh_epochs"),
+                )
+                register_translatable(components["rejection_refresh_epochs"],
+                                      label_key="config.rejection_refresh_epochs")
+            with gr.Row():
+                components["rejection_max_tokens"] = gr.Slider(
+                    minimum=64, maximum=2048, value=512, step=64,
+                    label=tr("config.rejection_max_tokens"),
+                )
+                register_translatable(components["rejection_max_tokens"],
+                                      label_key="config.rejection_max_tokens")
+                components["rejection_temperature"] = gr.Slider(
+                    minimum=0.0, maximum=2.0, value=0.7, step=0.1,
+                    label=tr("config.rejection_temperature"),
+                )
+                register_translatable(components["rejection_temperature"],
+                                      label_key="config.rejection_temperature")
+
         # ── 配置保存/加载 ────────────────────────────────────────────
         with gr.Row():
             save_config_btn = gr.Button(tr("config.save"), size="sm")
@@ -208,14 +258,15 @@ def build_config_tab(env_info: EnvironmentInfo) -> dict:
 
         # ── 事件 ────────────────────────────────────────────────────
 
-        # 训练类型切换 → 显示/隐藏 beta
+        # 训练类型切换 → 显示/隐藏 beta 和 auto_reject
         def on_training_type_change(t):
-            return gr.update(visible=(t in ("dpo", "orpo")))
+            is_pref = t in ("dpo", "orpo")
+            return gr.update(visible=is_pref), gr.update(visible=is_pref)
 
         components["training_type"].change(
             fn=on_training_type_change,
             inputs=[components["training_type"]],
-            outputs=[components["beta"]],
+            outputs=[components["beta"], acc_auto_reject],
         )
 
         # lora_r 同步 lora_alpha

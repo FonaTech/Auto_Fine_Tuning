@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# Unsloth GUI 安装脚本（Linux / macOS）
+# Auto_Fine_Tuning 安装脚本（Linux / macOS）
 # 用法: bash install.sh
 # ================================================================
 
@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "================================================================"
-echo "  Unsloth GUI Fine-Tuning Workbench - 安装脚本"
+echo "  Auto_Fine_Tuning — SFT · DPO · Auto-ORPO - 安装脚本"
 echo "================================================================"
 
 # ── 检测 Python ──────────────────────────────────────────────────

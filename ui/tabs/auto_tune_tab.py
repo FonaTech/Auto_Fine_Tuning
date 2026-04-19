@@ -255,6 +255,24 @@ def build_auto_tune_tab(
                 base_r, base_alpha, base_dropout = 16, 32, 0.0
                 base_targets = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
 
+            # Read training_type and rejection settings from the shared config so
+            # auto-tune runs the same training regime the user will eventually launch.
+            try:
+                tt_val = str(config_components["training_type"].value or "sft").lower()
+                auto_gen = bool(config_components.get("auto_generate_rejected",
+                                                     type("_", (), {"value": True})()).value)
+                rej_tokens = int(config_components.get("rejection_max_tokens",
+                                                      type("_", (), {"value": 512})()).value)
+                rej_temp = float(config_components.get("rejection_temperature",
+                                                      type("_", (), {"value": 0.7})()).value)
+                beta_v = float(config_components.get("beta",
+                                                    type("_", (), {"value": 0.1})()).value)
+                ams = bool(config_components.get("aggressive_memory_save",
+                                                 type("_", (), {"value": False})()).value)
+            except Exception:
+                tt_val, auto_gen, rej_tokens, rej_temp, beta_v, ams = \
+                    "sft", True, 512, 0.7, 0.1, False
+
             auto_tuner.start(
                 model_id=model_info["model_id"],
                 dataset_path=dataset_info["path"],
@@ -272,6 +290,12 @@ def build_auto_tune_tab(
                 base_lora_dropout=base_dropout,
                 target_modules=base_targets,
                 output_dir=str(output_dir_v) or "auto_tune_cache",
+                training_type=tt_val,
+                auto_generate_rejected=auto_gen,
+                rejection_max_tokens=rej_tokens,
+                rejection_temperature=rej_temp,
+                beta=beta_v,
+                aggressive_memory_save=ams,
             )
 
             yield (

@@ -259,6 +259,94 @@ def split_records(
 
 
 # ────────────────────────────────────────────────────────────────
+# SFT → Preference conversion
+# ────────────────────────────────────────────────────────────────
+
+def _build_prompt_only(
+    record: Dict,
+    template: str = "alpaca",
+    think_mode: str = "keep",
+) -> str:
+    """Build the prompt portion (without the output) for rejection generation."""
+    instruction = record.get("instruction", "").strip()
+    input_text = record.get("input", "").strip()
+    system = record.get("system", "").strip() or "You are a helpful assistant."
+
+    if template == "alpaca":
+        if input_text:
+            return (
+                "Below is an instruction that describes a task, paired with an input that provides "
+                "further context. Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n"
+            )
+        else:
+            return (
+                "Below is an instruction that describes a task. Write a response that "
+                "appropriately completes the request.\n\n"
+                f"### Instruction:\n{instruction}\n\n### Response:\n"
+            )
+    elif template == "chatml":
+        input_suffix = f"\n{input_text}" if input_text else ""
+        return (
+            f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{instruction}{input_suffix}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+    elif template == "llama3":
+        input_suffix = f"\n{input_text}" if input_text else ""
+        return (
+            f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            f"{system}<|eot_id|>"
+            f"<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{instruction}{input_suffix}<|eot_id|>"
+            f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+        )
+    else:
+        return f"{instruction}\n{input_text}\n" if input_text else f"{instruction}\n"
+
+
+def detect_dataset_type(records: List[Dict], sample_size: int = 10) -> str:
+    """Classify a dataset as 'preference' (has chosen+rejected on at least one
+    sampled record) or 'sft' (instruction/output style). Used by both the
+    trainer and auto-tuner to decide whether SFT→preference conversion is
+    needed for DPO/ORPO runs.
+    """
+    if not records:
+        return "sft"
+    sample = records[:max(1, sample_size)]
+    has_chosen = any(str(r.get("chosen", "")).strip() for r in sample)
+    has_rejected = any(str(r.get("rejected", "")).strip() for r in sample)
+    if has_chosen and has_rejected:
+        return "preference"
+    return "sft"
+
+
+def sft_to_preference_prompts(
+    records: List[Dict],
+    template: str = "alpaca",
+    think_mode: str = "keep",
+    max_chars: Optional[int] = None,
+) -> List[Dict]:
+    """
+    Convert SFT records to preference prompt pairs.
+    Returns list of {"prompt": str, "chosen": str} — rejected to be generated later.
+    """
+    result = []
+    for r in records:
+        instruction = r.get("instruction", "").strip()
+        output = r.get("output", "").strip()
+        if not instruction or not output:
+            continue
+        if think_mode == "strip":
+            output = strip_think_blocks(output)
+        prompt = _build_prompt_only(r, template, think_mode)
+        if max_chars and len(prompt) > max_chars:
+            prompt = prompt[:max_chars]
+        result.append({"prompt": prompt, "chosen": output})
+    return result
+
+
+# ────────────────────────────────────────────────────────────────
 # Statistics & Preview
 # ────────────────────────────────────────────────────────────────
 

@@ -1,13 +1,13 @@
 @echo off
 REM ================================================================
-REM Unsloth GUI 安装脚本（Windows）
+REM Auto_Fine_Tuning 安装脚本（Windows）
 REM 用法: 双击运行 install.bat 或在 CMD 中执行
 REM ================================================================
 
 setlocal
 
 echo ================================================================
-echo   Unsloth GUI Fine-Tuning Workbench - 安装脚本 (Windows)
+echo   Auto_Fine_Tuning — SFT · DPO · Auto-ORPO - 安装脚本 (Windows)
 echo ================================================================
 
 REM ── 检测 Python ─────────────────────────────────────────────────

@@ -77,6 +77,32 @@ class TrainingConfig:
     # DPO / ORPO
     beta: float = 0.1
 
+    # Auto-generate rejected responses (SFT→ORPO/DPO)
+    auto_generate_rejected: bool = True       # auto-detect and generate if SFT dataset
+    rejection_refresh_steps: int = 1000       # refresh rejection model every N steps (0=never)
+    rejection_refresh_epochs: bool = True     # also refresh at epoch boundaries
+    rejection_max_tokens: int = 512
+    rejection_temperature: float = 0.7
+
+    # How rejected samples are produced when auto_generate_rejected is True.
+    #   "dynamic"      — current behaviour: generate in background subprocess,
+    #                    train on sliding window as samples arrive
+    #   "pre_generate" — generate ALL rejected samples first, save preference
+    #                    dataset to disk, then run standard ORPO/DPO training
+    rejection_mode: str = "dynamic"
+    # Output path for the pre-generated preference dataset (when mode=pre_generate).
+    # Empty = auto-derive as `<output_dir>/preference_dataset.jsonl`.
+    pre_generated_dataset_path: str = ""
+
+    # Opt-in extreme memory-saving for preference training (DPO/ORPO).
+    # When True the trainer auto-halves per_device_train_batch_size, doubles
+    # gradient_accumulation_steps (to preserve effective batch), and caps
+    # max_seq_length at 1024. OFF by default so training dynamics exactly
+    # match the user's configured hyperparameters — use only when VRAM/RAM
+    # is genuinely insufficient, as these caps change gradient noise
+    # statistics and can truncate long sequences.
+    aggressive_memory_save: bool = False
+
     def to_dict(self) -> Dict:
         import dataclasses
         return dataclasses.asdict(self)
@@ -230,9 +256,19 @@ class TrainingOrchestrator:
             self.monitor.put({"type": "log", "line": f"Backend: {backend}"})
 
             self.monitor.put({"type": "log", "line": f"Loading dataset: {config.dataset_path}"})
+            self._auto_gen_prompts = None  # reset sentinel
             train_dataset, eval_dataset = self._prepare_datasets(config, backend)
-            n_train = len(train_dataset)
-            n_eval = len(eval_dataset) if eval_dataset else 0
+
+            # Check if auto-generation mode was triggered
+            auto_gen = self._auto_gen_prompts is not None
+
+            if not auto_gen:
+                n_train = len(train_dataset)
+                n_eval = len(eval_dataset) if eval_dataset else 0
+            else:
+                train_prompts, eval_prompts = self._auto_gen_prompts
+                n_train = len(train_prompts)
+                n_eval = len(eval_prompts) if eval_prompts else 0
 
             eff_batch = config.per_device_train_batch_size * config.gradient_accumulation_steps
             steps_per_epoch = max(1, n_train // eff_batch)
@@ -268,19 +304,63 @@ class TrainingOrchestrator:
             except Exception:
                 pass
 
-            callback = MetricsCallback(self.monitor, self._stop_event, config)
-            trainer = self._build_trainer(
-                config, backend, model, tokenizer,
-                train_dataset, eval_dataset, callback, total_steps
-            )
-
-            if backend == "mlx":
-                self._run_mlx_training(config, model, trainer)
+            if auto_gen:
+                if getattr(config, "rejection_mode", "dynamic") == "pre_generate":
+                    # Synchronously generate ALL rejected samples, persist the
+                    # preference dataset to disk, then fall through to a
+                    # standard (non-rolling) ORPO/DPO training pass.
+                    train_dataset, eval_dataset = self._run_pre_generate_preference(
+                        config, backend, train_prompts, eval_prompts
+                    )
+                    del train_prompts, eval_prompts
+                    self._auto_gen_prompts = None
+                    import gc as _gc_local
+                    _gc_local.collect()
+                    # Recompute steps from the materialised dataset size
+                    n_train = len(train_dataset)
+                    steps_per_epoch = max(1, n_train // eff_batch)
+                    total_steps = steps_per_epoch * config.num_epochs
+                    self.monitor.put({
+                        "type": "status", "status": "running", "total_steps": total_steps
+                    })
+                    self.monitor.put({
+                        "type": "log",
+                        "line": (f"Pre-generated preference dataset: Train={n_train}, "
+                                 f"Steps/epoch={steps_per_epoch}, Total steps={total_steps}"),
+                    })
+                    callback = MetricsCallback(self.monitor, self._stop_event, config)
+                    trainer = self._build_trainer(
+                        config, backend, model, tokenizer,
+                        train_dataset, eval_dataset, callback, total_steps
+                    )
+                    if backend == "mlx":
+                        self._run_mlx_training(config, model, trainer)
+                    else:
+                        resume_ckpt = config.resume_from_checkpoint or None
+                        trainer.train(resume_from_checkpoint=resume_ckpt)
+                else:
+                    # Dynamic ORPO/DPO: generate rejected responses and train
+                    self._run_dynamic_preference(config, backend, model, tokenizer,
+                                                 train_prompts, eval_prompts, total_steps)
+                    # Drop large prompt lists once dynamic training has consumed them
+                    del train_prompts, eval_prompts
+                    self._auto_gen_prompts = None
+                    import gc as _gc_local
+                    _gc_local.collect()
             else:
-                resume_ckpt = config.resume_from_checkpoint or None
-                if resume_ckpt:
-                    self.monitor.put({"type": "log", "line": f"Resuming from checkpoint: {resume_ckpt}"})
-                trainer.train(resume_from_checkpoint=resume_ckpt)
+                callback = MetricsCallback(self.monitor, self._stop_event, config)
+                trainer = self._build_trainer(
+                    config, backend, model, tokenizer,
+                    train_dataset, eval_dataset, callback, total_steps
+                )
+
+                if backend == "mlx":
+                    self._run_mlx_training(config, model, trainer)
+                else:
+                    resume_ckpt = config.resume_from_checkpoint or None
+                    if resume_ckpt:
+                        self.monitor.put({"type": "log", "line": f"Resuming from checkpoint: {resume_ckpt}"})
+                    trainer.train(resume_from_checkpoint=resume_ckpt)
 
             if not self._stop_event.is_set():
                 final_dir = os.path.join(config.output_dir, "final")
@@ -355,28 +435,46 @@ class TrainingOrchestrator:
                 max_chars=max_chars,
             ) if eval_recs else None
         else:
-            # DPO / ORPO: 保持原始字段 (prompt, chosen, rejected)
-            # Validate dataset has required fields
+            # DPO / ORPO: detect whether the dataset already carries preference
+            # pairs, or whether we need to auto-generate rejected responses.
+            from core.dataset import detect_dataset_type
             sample = train_recs[0] if train_recs else {}
-            has_chosen = any(r.get("chosen", "").strip() for r in train_recs[:10])
-            has_rejected = any(r.get("rejected", "").strip() for r in train_recs[:10])
-            if not has_chosen or not has_rejected:
+            ds_type = detect_dataset_type(train_recs)
+
+            if ds_type == "preference":
+                # Native preference dataset — use as-is
+                train_formatted = [
+                    {"prompt": r.get("prompt", ""), "chosen": r.get("chosen", ""), "rejected": r.get("rejected", "")}
+                    for r in train_recs
+                    if r.get("chosen", "").strip() and r.get("rejected", "").strip()
+                ]
+                eval_formatted = [
+                    {"prompt": r.get("prompt", ""), "chosen": r.get("chosen", ""), "rejected": r.get("rejected", "")}
+                    for r in eval_recs
+                    if r.get("chosen", "").strip() and r.get("rejected", "").strip()
+                ] if eval_recs else None
+            elif config.auto_generate_rejected:
+                # SFT dataset → auto-generate preference pairs
+                # Return a sentinel so _run() knows to use dynamic generation
+                from core.dataset import sft_to_preference_prompts
+                max_chars = config.max_seq_length * 4
+                train_prompts = sft_to_preference_prompts(
+                    train_recs, config.prompt_template, config.think_mode, max_chars)
+                eval_prompts = sft_to_preference_prompts(
+                    eval_recs, config.prompt_template, config.think_mode, max_chars) if eval_recs else None
+                self.monitor.put({"type": "log",
+                    "line": f"Auto-generating preference dataset: {len(train_prompts)} prompts "
+                            f"(chosen from SFT output, rejected will be generated by base model)"})
+                # Store for _run() to pick up
+                self._auto_gen_prompts = (train_prompts, eval_prompts)
+                return None, None  # sentinel: _run() handles dynamic dataset
+            else:
                 raise ValueError(
                     f"{config.training_type.upper()} training requires a dataset with "
                     f"'chosen' and 'rejected' fields, but the loaded dataset appears to be "
                     f"SFT format (fields: {list(sample.keys())}). "
                     f"Please use a preference dataset or switch training type to SFT."
                 )
-            train_formatted = [
-                {"prompt": r.get("prompt", ""), "chosen": r.get("chosen", ""), "rejected": r.get("rejected", "")}
-                for r in train_recs
-                if r.get("chosen", "").strip() and r.get("rejected", "").strip()
-            ]
-            eval_formatted = [
-                {"prompt": r.get("prompt", ""), "chosen": r.get("chosen", ""), "rejected": r.get("rejected", "")}
-                for r in eval_recs
-                if r.get("chosen", "").strip() and r.get("rejected", "").strip()
-            ] if eval_recs else None
 
         train_ds = HFDataset.from_list(train_formatted)
         eval_ds = HFDataset.from_list(eval_formatted) if eval_formatted else None
@@ -413,6 +511,17 @@ class TrainingOrchestrator:
 
     def _load_mlx_model(self, config: TrainingConfig):
         """使用 mlx_tune.FastLanguageModel 加载模型（Apple Silicon 原生）。"""
+        # Apply in-process memory patches to mlx_tune (stream log-probs via
+        # logsumexp + clear Metal cache per step). Safe no-op if mlx_tune not
+        # installed or already patched.
+        try:
+            from core.mlx_patches import apply_mlx_tune_patches
+            apply_mlx_tune_patches(
+                log_fn=lambda m: self.monitor.put({"type": "log", "line": m})
+            )
+        except Exception:
+            pass
+
         from mlx_tune import FastLanguageModel
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=config.model_id,
@@ -493,6 +602,293 @@ class TrainingOrchestrator:
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
         return model, tokenizer
+
+    # ── Dynamic preference training (SFT→ORPO/DPO auto-convert) ──
+
+    def _run_pre_generate_preference(self, config, backend, train_prompts, eval_prompts):
+        """Synchronously generate rejected samples for every prompt, persist
+        the resulting {prompt,chosen,rejected} preference dataset to disk,
+        and return (train_ds, eval_ds) ready for standard ORPO/DPO training.
+
+        This is the "pre_generate" rejection_mode — memory-friendly vs the
+        rolling "dynamic" mode because the rejection subprocess is fully done
+        (and terminated) before training starts.
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+        from datasets import Dataset as HFDataset
+        from core.rejection_generator import RejectionGenerator
+
+        monitor = self.monitor
+        stop_event = self._stop_event
+
+        out_path = (config.pre_generated_dataset_path or "").strip()
+        if not out_path:
+            _os.makedirs(config.output_dir, exist_ok=True)
+            out_path = _os.path.join(config.output_dir, "preference_dataset.jsonl")
+
+        def _generate_split(split_prompts, split_name):
+            if not split_prompts:
+                return []
+            gen_backend = "mlx" if backend == "mlx" else "gguf"
+            generator = RejectionGenerator(
+                model_path=config.model_id,
+                backend=gen_backend,
+                max_tokens=config.rejection_max_tokens,
+                temperature=config.rejection_temperature,
+                log_fn=lambda msg: monitor.put({"type": "log", "line": msg}),
+            )
+            results = []
+            try:
+                generator.start()
+                total = len(split_prompts)
+                monitor.put({"type": "log",
+                             "line": f"[pre_generate] {split_name}: generating "
+                                     f"{total} rejected responses..."})
+                t0 = _time.time()
+                for i, item in enumerate(split_prompts):
+                    if stop_event.is_set():
+                        break
+                    try:
+                        rejected = generator.generate(item["prompt"])
+                        results.append({
+                            "prompt": item["prompt"],
+                            "chosen": item["chosen"],
+                            "rejected": rejected,
+                        })
+                    except Exception as e:
+                        monitor.put({"type": "log",
+                                     "line": f"[pre_generate] sample {i}: {e}"})
+                    if (i + 1) % 10 == 0 or (i + 1) == total:
+                        elapsed = _time.time() - t0
+                        rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                        eta = (total - (i + 1)) / rate if rate > 0 else 0.0
+                        monitor.put({"type": "log",
+                                     "line": f"[pre_generate] {split_name}: "
+                                             f"{i+1}/{total}  {rate:.2f} it/s  "
+                                             f"ETA {int(eta)}s"})
+            finally:
+                generator.stop()
+            return results
+
+        train_records = _generate_split(train_prompts, "train")
+        if stop_event.is_set():
+            raise RuntimeError("Training stopped during preference pre-generation")
+        eval_records = _generate_split(eval_prompts, "eval") if eval_prompts else []
+
+        # Persist the preference dataset so it can be reused / inspected.
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                for rec in train_records:
+                    f.write(_json.dumps({**rec, "_split": "train"}, ensure_ascii=False) + "\n")
+                for rec in eval_records:
+                    f.write(_json.dumps({**rec, "_split": "eval"}, ensure_ascii=False) + "\n")
+            monitor.put({"type": "log",
+                         "line": f"[pre_generate] saved preference dataset -> {out_path}"})
+        except Exception as e:
+            monitor.put({"type": "log",
+                         "line": f"[pre_generate] WARN: failed to save dataset: {e}"})
+
+        train_ds = HFDataset.from_list(train_records) if train_records else None
+        eval_ds = HFDataset.from_list(eval_records) if eval_records else None
+        return train_ds, eval_ds
+
+    def _run_dynamic_preference(self, config, backend, model, tokenizer,
+                                train_prompts, eval_prompts, total_steps):
+        """
+        Generate rejected responses in background, train ORPO/DPO in batches.
+        The rejection model stays loaded in the subprocess — only reloads at
+        checkpoint refresh points (every N steps or epoch boundary).
+        """
+        import time
+        import gc as _gc
+        from datasets import Dataset as HFDataset
+        from core.rejection_generator import RejectionGenerator
+        from core.dynamic_dataset import DynamicPreferenceDataset
+
+        monitor = self.monitor
+        stop_event = self._stop_event
+        eff_batch = config.per_device_train_batch_size * config.gradient_accumulation_steps
+
+        # Create dynamic dataset buffer.
+        # After this call, the buffer owns the prompt list — null the local
+        # parameter references so the caller's `del` can actually free them.
+        n_train_prompts = len(train_prompts)
+        dataset = DynamicPreferenceDataset(train_prompts, batch_size=eff_batch)
+        train_prompts = None
+        eval_prompts = None
+        _gc.collect()
+
+        # Start rejection generator in subprocess (model loaded once, stays resident)
+        gen_backend = "mlx" if backend == "mlx" else "gguf"
+        generator = RejectionGenerator(
+            model_path=config.model_id,
+            backend=gen_backend,
+            max_tokens=config.rejection_max_tokens,
+            temperature=config.rejection_temperature,
+            log_fn=lambda msg: monitor.put({"type": "log", "line": msg}),
+        )
+
+        try:
+            generator.start()
+
+            # Background thread: generate rejected responses (subprocess stays alive)
+            def _generate_thread():
+                while not stop_event.is_set():
+                    pending = dataset.pop_pending(1)
+                    if not pending:
+                        break
+                    for item in pending:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            rejected = generator.generate(item["prompt"])
+                            item["rejected"] = rejected
+                            dataset.add(item)
+                        except Exception as e:
+                            dataset.add_error()
+                            monitor.put({"type": "log",
+                                         "line": f"[WARN] Rejection generation error: {e}"})
+                        gen_count, gen_total, gen_errors = dataset.get_progress()
+                        if gen_count % 10 == 0 or gen_count == gen_total:
+                            monitor.put({"type": "log",
+                                         "line": f"Generating rejected: {gen_count}/{gen_total}"
+                                                 + (f" ({gen_errors} errors)" if gen_errors else "")})
+                dataset.mark_done()
+
+            gen_thread = threading.Thread(target=_generate_thread, daemon=True)
+            gen_thread.start()
+
+            # Wait for first batch
+            monitor.put({"type": "log",
+                         "line": f"Waiting for first batch of rejected responses ({eff_batch} samples)..."})
+            if not dataset.wait_for_batch(timeout=600):
+                raise RuntimeError("Timeout waiting for rejected response generation")
+
+            if stop_event.is_set():
+                return
+
+            # Train in rounds with a sliding window: each round consumes up to
+            # WINDOW_MULTIPLIER * eff_batch freshly generated samples, trains on
+            # them, then discards them from the buffer so memory stays bounded.
+            monitor.put({"type": "log", "line": "Starting dynamic ORPO/DPO training..."})
+            global_step = 0
+            last_refresh_step = 0
+            epoch = 0
+            steps_per_epoch = max(1, n_train_prompts // eff_batch)
+            WINDOW_MULTIPLIER = 8
+            window_size = eff_batch * WINDOW_MULTIPLIER
+
+            while global_step < total_steps and not stop_event.is_set():
+                ready_n = dataset.peek_ready_count()
+                if ready_n < eff_batch:
+                    if dataset.is_done:
+                        break
+                    time.sleep(1)
+                    continue
+
+                # Consume a bounded window — samples are removed from the buffer
+                take = min(window_size, ready_n)
+                batch_samples = dataset.consume_ready(take)
+                if not batch_samples:
+                    time.sleep(1)
+                    continue
+
+                consumed_n = len(batch_samples)
+                train_ds = HFDataset.from_list(batch_samples)
+                # Release the Python list; Arrow now owns the data
+                del batch_samples
+                eval_ds = None
+
+                # Round budget: do `num_epochs` passes over the consumed
+                # window per round, capped by rejection refresh cadence and
+                # the remaining total step budget. MLX/HF trainers are forced
+                # to exactly `round_steps` optimiser steps via max_steps, so
+                # global_step accounting matches what actually ran.
+                round_steps = min(
+                    config.rejection_refresh_steps if config.rejection_refresh_steps > 0 else steps_per_epoch,
+                    total_steps - global_step,
+                    max(1, consumed_n * max(1, config.num_epochs) // eff_batch),
+                )
+
+                # Build and run trainer for this round
+                callback = MetricsCallback(self.monitor, self._stop_event, config)
+                trainer = self._build_trainer(
+                    config, backend, model, tokenizer,
+                    train_ds, eval_ds, callback, round_steps
+                )
+
+                if backend == "mlx":
+                    self._run_mlx_training(config, model, trainer)
+                else:
+                    trainer.train()
+
+                # Free trainer/dataset references between rounds to prevent memory creep
+                del trainer, train_ds, eval_ds, callback
+                _gc.collect()
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                    elif hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+                        try:
+                            _torch.mps.empty_cache()
+                        except Exception:
+                            pass
+                except ImportError:
+                    pass
+                if backend == "mlx":
+                    try:
+                        import mlx.core as mx
+                        mx.clear_cache()
+                    except Exception:
+                        pass
+
+                global_step += round_steps
+                monitor.put({"type": "log",
+                             "line": (f"Dynamic training round complete: "
+                                      f"step {global_step}/{total_steps} "
+                                      f"(+{round_steps} steps this round; "
+                                      f"consumed {consumed_n} samples; "
+                                      f"buffer remaining: {dataset.peek_ready_count()})")})
+
+                # Check epoch boundary
+                new_epoch = global_step // steps_per_epoch
+                if new_epoch > epoch:
+                    epoch = new_epoch
+                    monitor.put({"type": "log", "line": f"Epoch {epoch} complete"})
+
+                # Refresh rejection model if needed (only time subprocess reloads)
+                should_refresh = False
+                if config.rejection_refresh_steps > 0 and (global_step - last_refresh_step) >= config.rejection_refresh_steps:
+                    should_refresh = True
+                if config.rejection_refresh_epochs and new_epoch > (last_refresh_step // steps_per_epoch if steps_per_epoch else 0):
+                    should_refresh = True
+
+                if should_refresh and not dataset.is_done:
+                    last_refresh_step = global_step
+                    adapters_dir = os.path.join(config.output_dir, "adapters")
+                    os.makedirs(adapters_dir, exist_ok=True)
+                    try:
+                        model.save_pretrained(adapters_dir)
+                        monitor.put({"type": "log",
+                                     "line": f"Refreshing rejection model at step {global_step}..."})
+                        generator.reload_model(adapters_dir)
+                    except Exception as e:
+                        monitor.put({"type": "log",
+                                     "line": f"[WARN] Rejection model refresh failed: {e}"})
+
+        finally:
+            # Always clean up subprocess
+            generator.stop()
+            if 'gen_thread' in dir() and gen_thread.is_alive():
+                gen_thread.join(timeout=10)
+
+        gen_count, gen_total, gen_errors = dataset.get_progress()
+        monitor.put({"type": "log",
+                     "line": f"Dynamic preference training complete. "
+                             f"Generated: {gen_count}/{gen_total}, Errors: {gen_errors}"})
 
     # ── MLX training ──────────────────────────────────────────────
 
@@ -713,7 +1109,9 @@ class TrainingOrchestrator:
         train_dataset, eval_dataset, callback_helper, total_steps
     ):
         if backend == "mlx":
-            return self._build_mlx_trainer(config, model, tokenizer, train_dataset, eval_dataset)
+            return self._build_mlx_trainer(config, model, tokenizer,
+                                           train_dataset, eval_dataset,
+                                           max_steps=total_steps)
 
         from trl import SFTTrainer, DPOTrainer, ORPOTrainer
 
@@ -760,9 +1158,10 @@ class TrainingOrchestrator:
             )
         elif config.training_type == "orpo":
             from trl import ORPOConfig
+            pref_batch, pref_accum, pref_max_seq = self._preference_memory_caps(config)
             orpo_args = ORPOConfig(
-                per_device_train_batch_size=config.per_device_train_batch_size,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
+                per_device_train_batch_size=pref_batch,
+                gradient_accumulation_steps=pref_accum,
                 num_train_epochs=config.num_epochs,
                 learning_rate=config.learning_rate,
                 warmup_ratio=config.warmup_ratio,
@@ -778,9 +1177,9 @@ class TrainingOrchestrator:
                 output_dir=config.output_dir,
                 seed=config.seed,
                 beta=config.beta,
-                max_length=config.max_seq_length,
-                max_prompt_length=config.max_seq_length // 2,
-                remove_unused_columns=False,
+                max_length=pref_max_seq,
+                max_prompt_length=pref_max_seq // 2,
+                remove_unused_columns=True,
             )
             trainer = ORPOTrainer(
                 model=model,
@@ -795,8 +1194,57 @@ class TrainingOrchestrator:
 
         return trainer
 
-    def _build_mlx_trainer(self, config, model, tokenizer, train_dataset, eval_dataset):
-        """构建 mlx_tune 训练器（SFT / DPO / ORPO）。"""
+    def _preference_memory_caps(self, config: TrainingConfig):
+        """Return (batch, grad_accum, max_seq) for DPO/ORPO.
+
+        Default: return the user's exact configured values — preference
+        training runs at the same hyperparameters as SFT so training
+        dynamics are not silently altered.
+
+        Opt-in (`config.aggressive_memory_save=True`): halve the batch,
+        double gradient accumulation (to keep effective batch), and cap
+        sequence length at 1024. Intended only for genuinely
+        memory-constrained hosts; this changes gradient noise statistics
+        and may truncate long sequences.
+        """
+        if not getattr(config, "aggressive_memory_save", False):
+            return (
+                config.per_device_train_batch_size,
+                config.gradient_accumulation_steps,
+                config.max_seq_length,
+            )
+        pref_batch = max(1, config.per_device_train_batch_size // 2)
+        pref_accum = max(1, config.gradient_accumulation_steps * 2)
+        pref_max_seq = min(config.max_seq_length, 1024)
+        if (pref_batch != config.per_device_train_batch_size
+                or pref_max_seq != config.max_seq_length):
+            try:
+                self.monitor.put({
+                    "type": "log",
+                    "line": (
+                        "[Preference memory caps] "
+                        f"batch={config.per_device_train_batch_size}->{pref_batch}, "
+                        f"grad_accum={config.gradient_accumulation_steps}->{pref_accum}, "
+                        f"max_seq_length={config.max_seq_length}->{pref_max_seq} "
+                        "(aggressive_memory_save=True)"
+                    ),
+                })
+            except Exception:
+                pass
+        return pref_batch, pref_accum, pref_max_seq
+
+    def _build_mlx_trainer(self, config, model, tokenizer,
+                           train_dataset, eval_dataset,
+                           max_steps: int = 0):
+        """构建 mlx_tune 训练器（SFT / DPO / ORPO）。
+
+        When ``max_steps > 0`` the trainer is forced to execute exactly that
+        many optimisation steps. Used by the dynamic preference rolling loop
+        to keep the outer ``global_step`` counter in sync with the actual
+        number of iterations the MLX trainer performs each round (otherwise
+        mlx_tune falls back to ``num_train_epochs × len(dataset) / batch``
+        and silently out-runs our accounting).
+        """
         import os
 
         os.makedirs(config.output_dir, exist_ok=True)
@@ -813,6 +1261,12 @@ class TrainingOrchestrator:
         train_list = _to_list(train_dataset)
         eval_list = _to_list(eval_dataset)
         del train_dataset, eval_dataset
+
+        # Optionally force an exact iter count (used by the dynamic preference
+        # rolling loop). Pass max_steps into whichever mlx_tune config accepts
+        # it; we add it conditionally so SFTConfig/ORPOConfig/DPOConfig that
+        # don't expose the field won't break.
+        extra_args = {"max_steps": int(max_steps)} if max_steps and max_steps > 0 else {}
 
         if config.training_type == "sft":
             from mlx_tune import SFTTrainer, SFTConfig
@@ -831,6 +1285,7 @@ class TrainingOrchestrator:
                 max_seq_length=config.max_seq_length,
                 packing=config.packing,
                 use_native_training=True,
+                **extra_args,
             )
             trainer = SFTTrainer(
                 model=model,
@@ -843,17 +1298,22 @@ class TrainingOrchestrator:
 
         elif config.training_type == "dpo":
             from mlx_tune import DPOTrainer, DPOConfig
+            # DPO/ORPO do two forward passes per step and retain both activation
+            # graphs for backward — halve the effective batch to keep MLX peak
+            # memory roughly comparable to SFT.
+            pref_batch, pref_accum, pref_max_seq = self._preference_memory_caps(config)
             args = DPOConfig(
                 beta=config.beta,
                 output_dir=config.output_dir,
                 learning_rate=config.learning_rate,
-                per_device_train_batch_size=config.per_device_train_batch_size,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
+                per_device_train_batch_size=pref_batch,
+                gradient_accumulation_steps=pref_accum,
                 num_train_epochs=config.num_epochs,
                 logging_steps=config.logging_steps,
                 save_steps=config.save_steps,
-                max_seq_length=config.max_seq_length,
-                max_prompt_length=config.max_seq_length // 2,
+                max_seq_length=pref_max_seq,
+                max_prompt_length=pref_max_seq // 2,
+                **extra_args,
             )
             trainer = DPOTrainer(
                 model=model,
@@ -865,17 +1325,19 @@ class TrainingOrchestrator:
 
         elif config.training_type == "orpo":
             from mlx_tune import ORPOTrainer, ORPOConfig
+            pref_batch, pref_accum, pref_max_seq = self._preference_memory_caps(config)
             args = ORPOConfig(
                 beta=config.beta,
                 output_dir=config.output_dir,
                 learning_rate=config.learning_rate,
-                per_device_train_batch_size=config.per_device_train_batch_size,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
+                per_device_train_batch_size=pref_batch,
+                gradient_accumulation_steps=pref_accum,
                 num_train_epochs=config.num_epochs,
                 logging_steps=config.logging_steps,
                 save_steps=config.save_steps,
-                max_seq_length=config.max_seq_length,
-                max_prompt_length=config.max_seq_length // 2,
+                max_seq_length=pref_max_seq,
+                max_prompt_length=pref_max_seq // 2,
+                **extra_args,
             )
             trainer = ORPOTrainer(
                 model=model,
@@ -886,5 +1348,16 @@ class TrainingOrchestrator:
 
         else:
             raise ValueError(f"未知训练类型：{config.training_type}")
+
+        # If max_steps was requested but the mlx_tune config rejected the kwarg
+        # (older versions), force it directly on the trainer's iter count so the
+        # outer step accounting remains accurate.
+        if max_steps and max_steps > 0:
+            for attr in ("iters", "max_steps"):
+                if hasattr(trainer, attr):
+                    try:
+                        setattr(trainer, attr, int(max_steps))
+                    except Exception:
+                        pass
 
         return trainer

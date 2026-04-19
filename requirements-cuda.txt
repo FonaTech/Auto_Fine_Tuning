@@ -1,5 +1,5 @@
 # ================================================================
-# Unsloth GUI - CUDA 依赖（Linux / Windows，NVIDIA GPU）
+# Auto_Fine_Tuning - CUDA 依赖（Linux / Windows，NVIDIA GPU）
 # ================================================================
 
 # GUI 框架

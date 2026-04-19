@@ -1,6 +1,6 @@
 """
 app.py
-Main entry point for the Unsloth GUI fine-tuning workbench.
+Main entry point for Auto_Fine_Tuning — SFT · DPO · Auto-ORPO.
 Usage: python app.py [--port 7860] [--no-browser]
 """
 
@@ -25,7 +25,7 @@ def _get_lan_ip() -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unsloth GUI fine-tuning workbench")
+    parser = argparse.ArgumentParser(description="Auto_Fine_Tuning — SFT · DPO · Auto-ORPO")
     parser.add_argument("--port", type=int, default=7860, help="Gradio server port (default: 7860)")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Bind address (default: 0.0.0.0 for LAN+localhost; use 127.0.0.1 for localhost only)")
@@ -47,7 +47,7 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("  Unsloth GUI Fine-Tuning Workbench")
+    print("  Auto_Fine_Tuning — SFT · DPO · Auto-ORPO")
     print("=" * 60)
     print("Initializing environment detection...")
 

@@ -1,5 +1,5 @@
 # ================================================================
-# Unsloth GUI - macOS MPS/MLX 依赖（Apple Silicon / Intel Mac）
+# Auto_Fine_Tuning - macOS MPS/MLX 依赖（Apple Silicon / Intel Mac）
 # ================================================================
 # 推荐后端优先级：mlx-tune > hf_mps > hf_cpu
 # mlx-tune 使用 Apple Silicon 原生 MLX 框架，无需 bitsandbytes。

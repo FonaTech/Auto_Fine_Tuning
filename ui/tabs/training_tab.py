@@ -124,6 +124,10 @@ def build_training_tab(
             "max_seq_length", "neftune_noise_alpha",
             "output_dir", "save_steps", "save_total_limit",
             "logging_steps", "report_to",
+            "rejection_refresh_steps", "rejection_refresh_epochs",
+            "rejection_max_tokens", "rejection_temperature",
+            "rejection_mode",
+            "aggressive_memory_save",
         ]
         config_inputs = [config_components[k] for k in _CONFIG_KEYS]
 
@@ -319,6 +323,10 @@ def build_training_tab(
             max_seq_length, neftune,
             output_dir, save_steps, save_total_limit,
             logging_steps, report_to,
+            rejection_refresh_steps, rejection_refresh_epochs,
+            rejection_max_tokens, rejection_temperature,
+            rejection_mode,
+            aggressive_memory_save,
             request: gr.Request,
         ):
             session_id = getattr(request, "session_hash", "__singleton__")
@@ -414,6 +422,12 @@ def build_training_tab(
                 logging_steps=int(logging_steps),
                 report_to=str(report_to),
                 resume_from_checkpoint=(resume_ckpt if resume_on and resume_ckpt else ""),
+                rejection_refresh_steps=int(rejection_refresh_steps),
+                rejection_refresh_epochs=bool(rejection_refresh_epochs),
+                rejection_max_tokens=int(rejection_max_tokens),
+                rejection_temperature=float(rejection_temperature),
+                rejection_mode=str(rejection_mode or "dynamic"),
+                aggressive_memory_save=bool(aggressive_memory_save),
             )
 
             # In per_session mode, isolate output to a session-specific subdirectory

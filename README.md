@@ -1,4 +1,80 @@
-# Unsloth GUI Fine-Tuning Workbench
+# Auto_Fine_Tuning — SFT · DPO · Auto-ORPO
+
+`Auto_Fine_Tuning` is a local, single-machine fine-tuning workbench that turns **any SFT dataset** into a first-class **preference-optimised model** without manual preference-pair labelling. It auto-detects whether your dataset is SFT-style or already carries preference pairs, auto-generates rejected responses with the base model in an isolated subprocess, and runs ORPO / DPO end-to-end from a Gradio web UI.
+
+**Headline capabilities**
+
+- **Auto-ORPO / Auto-DPO** — feed an SFT (`instruction → output`) dataset; the system synthesises `rejected` samples and trains ORPO or DPO with no extra data work
+- **Two rejection-synthesis modes** — `dynamic` (rolling sliding-window: generate and train concurrently) or `pre_generate` (synthesise and persist the full preference JSONL first, then train) — selectable in the UI
+- **Isolated rejection subprocess** — the base model used to generate `rejected` runs in a dedicated MLX/GGUF subprocess, keeping the training process's Metal/CUDA state independent
+- **Quality-neutral memory patches** — at runtime, `mlx_tune.compute_log_probs*` are swapped to a `logits − logsumexp` formulation (mathematically identical, skips materialising the `[B, S, V]` log-softmax tensor) and per-step `mx.clear_cache()` is injected — no behavioural change, large peak-memory savings on high-vocab models (Qwen, Llama 3)
+- **Optuna auto hyperparameter search** across SFT · DPO · ORPO, with synchronous rejected pre-generation for fair probe trials
+- **Multi-backend**: MLX (Apple Silicon) / Unsloth CUDA / HuggingFace CUDA · MPS · CPU — chosen automatically
+
+---
+
+## Architecture — what makes Auto_Fine_Tuning different
+
+```
+                          ┌─────────────────────────┐
+                          │        User / UI        │   ← Gradio web UI, 4 languages
+                          └────────────┬────────────┘
+                                       │
+                  ┌────────────────────┴────────────────────┐
+                  │       Auto dataset-type detection       │   ← SFT vs preference in one call
+                  │    (core/dataset.detect_dataset_type)   │
+                  └──────────────┬──────────────────────────┘
+                                 │
+                 ┌───────────────┴───────────────┐
+                 │                               │
+        ┌────────▼──────────┐         ┌──────────▼──────────┐
+        │   SFT pipeline    │         │  Preference pipeline│
+        │  (trl.SFTTrainer  │         │ (ORPO / DPO, auto   │
+        │   / mlx_tune)     │         │  rejected synthesis)│
+        └────────┬──────────┘         └──────────┬──────────┘
+                 │                               │
+                 │                   ┌───────────┴───────────┐
+                 │                   │                       │
+                 │          ┌────────▼────────┐    ┌─────────▼────────┐
+                 │          │ dynamic mode    │    │ pre_generate     │
+                 │          │ sliding window  │    │ offline JSONL    │
+                 │          │ consume_ready   │    │ + standard train │
+                 │          └────────┬────────┘    └─────────┬────────┘
+                 │                   │                       │
+                 │                   └───────────┬───────────┘
+                 │                               │
+                 │                ┌──────────────▼──────────────┐
+                 │                │ Isolated rejection subproc  │   ← own model,
+                 │                │ (MLX / llama-cli)           │     no Metal cmd-buffer
+                 │                │ checkpoint-refresh aware    │     conflicts w/ trainer
+                 │                └──────────────┬──────────────┘
+                 │                               │
+                 └───────────────┬───────────────┘
+                                 │
+                  ┌──────────────▼──────────────┐
+                  │ Quality-neutral MLX patches │   ← logsumexp log-prob,
+                  │ (core/mlx_patches.py)       │     per-step clear_cache
+                  │ runtime monkey-patch —      │     installs at startup,
+                  │ pip package untouched       │     no-op on non-MLX hosts
+                  └──────────────┬──────────────┘
+                                 │
+                  ┌──────────────▼──────────────┐
+                  │ Backend dispatch            │   ← MLX / Unsloth CUDA /
+                  │ (auto-detected at launch)   │     HF CUDA · MPS · CPU
+                  └─────────────────────────────┘
+```
+
+**How this compares to existing tooling**
+
+| Feature | Typical SFT tool (axolotl, llama-factory, trl-cli) | Auto_Fine_Tuning |
+|---|---|---|
+| SFT dataset → ORPO/DPO | Manual: user must produce a preference dataset | **Automatic**: SFT is auto-detected, `rejected` is generated from the base model |
+| Rejection generation | Offline script, separate pipeline | **Built-in** with two modes (dynamic rolling, or pre-generate + cache) |
+| Rejection model isolation | Same process — can collide with trainer's Metal/CUDA state | **Dedicated subprocess** with explicit lifecycle |
+| MLX ORPO memory peak | Full `[B, S, V]` log-softmax materialised per forward | **Streamed** via `logits − logsumexp` — math-identical, GB-scale savings |
+| Metal allocator fragmentation | Grows across steps | **`mx.clear_cache()`** injected per step, no source-package edit |
+| Hyperparameter search for preference training | Usually SFT-only | **Optuna across SFT · DPO · ORPO** with preference-aware probes |
+| Changes to pip-installed `mlx_tune` | Fork required | **Zero** — runtime monkey-patch inside our own process |
 
 `unsloth-gui` is a local, single-machine visual fine-tuning workbench for large language models. It provides a Gradio-based web interface that unifies dataset preparation, model selection, LoRA configuration, training monitoring, checkpoint management, model export, and Bayesian hyperparameter search into one cohesive workflow.
 
