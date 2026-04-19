@@ -1,4 +1,4 @@
-# Auto_Fine_Tuning — SFT · DPO · Auto-ORPO
+# Auto_Fine_Tuning — SFT · Auto-DPO · Auto-ORPO
 
 `Auto_Fine_Tuning` is a local, single-machine fine-tuning workbench that turns **any SFT dataset** into a first-class **preference-optimised model** without manual preference-pair labelling. It auto-detects whether your dataset is SFT-style or already carries preference pairs, auto-generates rejected responses with the base model in an isolated subprocess, and runs ORPO / DPO end-to-end from a Gradio web UI.
 
